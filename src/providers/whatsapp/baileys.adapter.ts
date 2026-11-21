@@ -10,6 +10,7 @@ import { env } from '../../config/env.js';
 import { prisma } from '../../config/prisma.js';
 import { IMessageProvider, SendMessageOptions } from '../provider.interface.js';
 import { usePostgresAuthState } from './postgres.auth.js';
+import { disconnectAction, disconnectReasonName } from './disconnect-policy.js';
 import { telegramAdapter } from '../telegram/telegram.adapter.js';
 import { formatMessageContent } from '../../utils/message-format.js';
 import { fetchSafeMedia } from '../../utils/safe-url.js';
@@ -290,28 +291,29 @@ export class WhatsAppAdapter implements IMessageProvider {
 
         if (connection === 'close') {
           const statusCode = (lastDisconnect?.error as { output?: { statusCode?: number } })?.output?.statusCode;
+          const action = disconnectAction(statusCode);
+          // Todo cierre queda en el registro con su código, aunque no haya alertas por Telegram
+          console.warn(
+            `[WhatsApp:${tenantId}] Conexión cerrada (code: ${statusCode ?? '-'}, ${disconnectReasonName(statusCode)}): ${action}${
+              lastDisconnect?.error?.message ? ` | ${lastDisconnect.error.message}` : ''
+            }`
+          );
 
-          // 1. Cierre de sesión explícito o sesión corrupta -> limpiar credenciales y alertar
-          if (
-            statusCode === DisconnectReason.loggedOut ||
-            statusCode === DisconnectReason.badSession ||
-            statusCode === DisconnectReason.multideviceMismatch
-          ) {
+          // 1. El teléfono quitó el dispositivo (401) -> las credenciales ya no sirven: limpiar y alertar
+          if (action === 'cerrar-sesion') {
             instanceState.status = 'DISCONNECTED';
             this.sessions.delete(tenantId);
             await clearSession();
+            console.warn(`[WhatsApp:${tenantId}] Credenciales eliminadas: hay que vincular el número de nuevo`);
             await telegramAdapter.sendAdminAlert(
-              `⚠️ [I-API] Sesión de WhatsApp (${tenantId}) cerrada o corrupta (code: ${statusCode}). Requiere revinculación.`
+              `⚠️ [I-API] Sesión de WhatsApp (${tenantId}) cerrada desde el teléfono (code: ${statusCode}). Requiere revinculación.`
             );
             finish({ status: 'DISCONNECTED' });
             return;
           }
 
           // 2. Número restringido (403) o sesión reemplazada en otro lugar (440) -> NO reconectar en bucle
-          if (
-            statusCode === DisconnectReason.forbidden ||
-            statusCode === DisconnectReason.connectionReplaced
-          ) {
+          if (action === 'detener') {
             instanceState.status = 'DISCONNECTED';
             await telegramAdapter.sendAdminAlert(
               `🚨 [I-API] Reconexión detenida para proyecto ${tenantId} (code: ${statusCode} - ${
@@ -323,7 +325,7 @@ export class WhatsAppAdapter implements IMessageProvider {
           }
 
           // 3. Reinicio requerido por WhatsApp tras emparejar (515) -> reconexión inmediata
-          if (statusCode === DisconnectReason.restartRequired) {
+          if (action === 'reiniciar') {
             console.log(`[WhatsApp:${tenantId}] Reinicio requerido tras vinculación (515), reconectando...`);
             instanceState.reconnectTimer = setTimeout(() => {
               this.connectInstance(tenantId, undefined, true).catch((e) =>
@@ -333,10 +335,14 @@ export class WhatsAppAdapter implements IMessageProvider {
             return;
           }
 
-          // 4. Errores de red transitorios -> Backoff exponencial (4s, 8s, 16s... máx 5 min) con límite de intentos
+          // 4. Cualquier otro corte (red, 500, 411...) -> Backoff exponencial (4s, 8s, 16s... máx 5 min) con
+          // límite de intentos. Las credenciales se conservan: al reiniciar el servidor se vuelve a intentar.
           instanceState.reconnectAttempts += 1;
           if (instanceState.reconnectAttempts > MAX_RECONNECT_ATTEMPTS) {
             instanceState.status = 'DISCONNECTED';
+            console.warn(
+              `[WhatsApp:${tenantId}] Reconexión detenida tras ${MAX_RECONNECT_ATTEMPTS} intentos (último code: ${statusCode ?? '-'})`
+            );
             await telegramAdapter.sendAdminAlert(
               `⚠️ [I-API] Se alcanzó el límite de ${MAX_RECONNECT_ATTEMPTS} intentos de reconexión para ${tenantId} (último code: ${statusCode}).`
             );
